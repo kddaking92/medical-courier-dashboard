@@ -705,11 +705,3 @@ function Td({ children, colSpan }: { children: React.ReactNode; colSpan?: number
     </td>
   );
 }
-
-function Td({ children, colSpan }: { children: React.ReactNode; colSpan?: number }) {
-  return (
-    <td colSpan={colSpan} style={{ padding: 10, verticalAlign: "top" }}>
-      {children}
-    </td>
-  );
-}
