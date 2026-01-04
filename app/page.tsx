@@ -59,17 +59,29 @@ export default function DashboardPage() {
   const [newOwner, setNewOwner] = useState<Owner>(OWNER_A);
   const [newDesc, setNewDesc] = useState<string>("");
 
-  // Notes state
+  // Notes state:
   // notesByTask[taskId][owner] = { note, updated_at }
   const [notesByTask, setNotesByTask] = useState<
     Record<string, Record<string, { note: string; updated_at?: string; id?: string }>>
   >({});
 
-  // Draft notes in UI (so typing doesn't instantly overwrite saved state)
+  // Draft notes for typing (autosave reads from this)
   const [draftByTask, setDraftByTask] = useState<Record<string, Record<string, string>>>({});
 
   // For realtime filtering
   const taskIdSetRef = useRef<Set<string>>(new Set());
+
+  // Autosave debounce timers and in-flight tracker
+  const autosaveTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const autosaveInFlightRef = useRef<Set<string>>(new Set());
+
+  // Optional: show "Saving..." per task+owner
+  const [savingKeys, setSavingKeys] = useState<Record<string, boolean>>({});
+
+  const makeKey = (taskId: string, owner: Owner) => `${taskId}::${owner}`;
+  const setSaving = (key: string, val: boolean) => {
+    setSavingKeys((prev) => ({ ...prev, [key]: val }));
+  };
 
   // ---------- AUTH GATE ----------
   useEffect(() => {
@@ -137,37 +149,9 @@ export default function DashboardPage() {
     }
   };
 
-  const loadTasks = async (weekNum: number) => {
-    setErrorMsg("");
-    setLoadingTasks(true);
-
-    const { data, error } = await supabase
-      .from("tasks")
-      .select("id,week_number,owner,description,status,created_at,updated_at")
-      .eq("week_number", weekNum)
-      .order("created_at", { ascending: false });
-
-    setLoadingTasks(false);
-
-    if (error) {
-      console.error(error);
-      setErrorMsg(`Failed to load tasks: ${error.message}`);
-      return;
-    }
-
-    const rows = (data ?? []) as TaskRow[];
-    setTasks(rows);
-
-    // Update taskId set for realtime filtering
-    const set = new Set<string>(rows.map((t) => t.id));
-    taskIdSetRef.current = set;
-
-    // Load notes for these tasks
-    await loadNotesForTasks(rows.map((t) => t.id));
-  };
-
   const loadNotesForTasks = async (taskIds: string[]) => {
     setErrorMsg("");
+
     if (taskIds.length === 0) {
       setNotesByTask({});
       setDraftByTask({});
@@ -210,6 +194,35 @@ export default function DashboardPage() {
     setDraftByTask(nextDraft);
   };
 
+  const loadTasks = async (weekNum: number) => {
+    setErrorMsg("");
+    setLoadingTasks(true);
+
+    const { data, error } = await supabase
+      .from("tasks")
+      .select("id,week_number,owner,description,status,created_at,updated_at")
+      .eq("week_number", weekNum)
+      .order("created_at", { ascending: false });
+
+    setLoadingTasks(false);
+
+    if (error) {
+      console.error(error);
+      setErrorMsg(`Failed to load tasks: ${error.message}`);
+      return;
+    }
+
+    const rows = (data ?? []) as TaskRow[];
+    setTasks(rows);
+
+    // Update taskId set for realtime filtering
+    const set = new Set<string>(rows.map((t) => t.id));
+    taskIdSetRef.current = set;
+
+    // Load notes for these tasks
+    await loadNotesForTasks(rows.map((t) => t.id));
+  };
+
   useEffect(() => {
     if (!authChecked) return;
     loadWeeks();
@@ -227,7 +240,6 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!authChecked || !selectedWeek) return;
 
-    // Tasks realtime by week filter
     const tasksChannel = supabase
       .channel(`tasks-week-${selectedWeek}`)
       .on(
@@ -239,13 +251,11 @@ export default function DashboardPage() {
       )
       .subscribe();
 
-    // Notes realtime (no reliable week filter), so we filter in callback by task_id set
     const notesChannel = supabase
       .channel(`task-notes`)
       .on("postgres_changes", { event: "*", schema: "public", table: "task_notes" }, async (payload: any) => {
         const taskId = payload?.new?.task_id ?? payload?.old?.task_id;
         if (taskId && taskIdSetRef.current.has(taskId)) {
-          // reload notes for current tasks only
           await loadNotesForTasks(Array.from(taskIdSetRef.current));
         }
       })
@@ -280,7 +290,7 @@ export default function DashboardPage() {
     }
 
     setNewDesc("");
-    // realtime will refresh
+    // realtime refreshes
   };
 
   const setTaskCompleted = async (taskId: string, completed: boolean) => {
@@ -303,10 +313,19 @@ export default function DashboardPage() {
     }
   };
 
-  // Upsert note (one row per task + owner)
-  const saveNote = async (taskId: string, owner: Owner) => {
+  // Upsert note (one row per task + owner) + supports autosave overrides
+  const saveNote = async (taskId: string, owner: Owner, noteOverride?: string) => {
     setErrorMsg("");
-    const note = (draftByTask?.[taskId]?.[owner] ?? "").trim();
+
+    const raw = noteOverride ?? (draftByTask?.[taskId]?.[owner] ?? "");
+    const note = raw.trim();
+
+    const key = makeKey(taskId, owner);
+
+    // Prevent overlapping autosaves for same task+owner
+    if (autosaveInFlightRef.current.has(key)) return;
+    autosaveInFlightRef.current.add(key);
+    setSaving(key, true);
 
     const { error } = await supabase.from("task_notes").upsert(
       {
@@ -317,13 +336,16 @@ export default function DashboardPage() {
       { onConflict: "task_id,owner" }
     );
 
+    autosaveInFlightRef.current.delete(key);
+    setSaving(key, false);
+
     if (error) {
       console.error(error);
       setErrorMsg(`Failed to save note: ${error.message}`);
       return;
     }
 
-    // realtime will refresh notes; but we can optimistic update too:
+    // Optimistic update (realtime will also refresh)
     setNotesByTask((prev) => {
       const next = { ...prev };
       next[taskId] = { ...(next[taskId] ?? {}) };
@@ -331,6 +353,45 @@ export default function DashboardPage() {
       return next;
     });
   };
+
+  // ---------- AUTOSAVE (DEBOUNCED) ----------
+  useEffect(() => {
+    const delayMs = 1500;
+
+    for (const task of tasks) {
+      const taskId = task.id;
+
+      for (const owner of ALL_OWNERS) {
+        const draft = draftByTask?.[taskId]?.[owner] ?? "";
+        const saved = notesByTask?.[taskId]?.[owner]?.note ?? "";
+
+        // Only autosave when there is an actual change
+        if (draft === saved) continue;
+
+        const key = makeKey(taskId, owner);
+
+        // Clear any existing timer
+        const existing = autosaveTimersRef.current[key];
+        if (existing) clearTimeout(existing);
+
+        // Set new debounce timer
+        autosaveTimersRef.current[key] = setTimeout(() => {
+          const latestDraft = draftByTask?.[taskId]?.[owner] ?? "";
+          const latestSaved = notesByTask?.[taskId]?.[owner]?.note ?? "";
+          if (latestDraft !== latestSaved) {
+            saveNote(taskId, owner, latestDraft);
+          }
+        }, delayMs);
+      }
+    }
+
+    return () => {
+      for (const key of Object.keys(autosaveTimersRef.current)) {
+        clearTimeout(autosaveTimersRef.current[key]);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftByTask, notesByTask, tasks]);
 
   const signOut = async () => {
     await supabase.auth.signOut();
@@ -426,7 +487,8 @@ export default function DashboardPage() {
               <strong>
                 {completedCount}/{tasks.length}
               </strong>{" "}
-              tasks completed ({progressPct}%){loadingTasks ? <span style={{ marginLeft: 10 }}>Loading tasks…</span> : null}
+              tasks completed ({progressPct}%)
+              {loadingTasks ? <span style={{ marginLeft: 10 }}>Loading tasks…</span> : null}
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -468,7 +530,7 @@ export default function DashboardPage() {
                 <Th>Owner</Th>
                 <Th>Description</Th>
                 <Th>Status</Th>
-                <Th>Updates (Real-time)</Th>
+                <Th>Updates (Auto-save)</Th>
               </tr>
             </thead>
             <tbody>
@@ -479,6 +541,7 @@ export default function DashboardPage() {
               ) : (
                 tasks.map((t) => {
                   const checked = t.status === "Completed";
+
                   const notesA = notesByTask?.[t.id]?.[OWNER_A];
                   const notesB = notesByTask?.[t.id]?.[OWNER_B];
 
@@ -536,7 +599,9 @@ export default function DashboardPage() {
                                 Save update
                               </button>
                               <div style={{ fontSize: 12, color: "#666" }}>
-                                Last: {fmtDate(notesA?.updated_at)}
+                                {savingKeys[makeKey(t.id, OWNER_A)]
+                                  ? "Saving…"
+                                  : `Last: ${fmtDate(notesA?.updated_at)}`}
                               </div>
                             </div>
                           </div>
@@ -559,7 +624,9 @@ export default function DashboardPage() {
                                 Save update
                               </button>
                               <div style={{ fontSize: 12, color: "#666" }}>
-                                Last: {fmtDate(notesB?.updated_at)}
+                                {savingKeys[makeKey(t.id, OWNER_B)]
+                                  ? "Saving…"
+                                  : `Last: ${fmtDate(notesB?.updated_at)}`}
                               </div>
                             </div>
                           </div>
@@ -574,7 +641,8 @@ export default function DashboardPage() {
         </div>
 
         <p style={{ color: "#666", marginTop: 10, fontSize: 13 }}>
-          Notes are stored in Supabase (<code>task_notes</code>). Updates are shared in real time across users.
+          Notes auto-save after you stop typing (1.5s debounce). Notes are stored in Supabase (<code>task_notes</code>)
+          and shared in real time.
         </p>
       </section>
     </div>
@@ -628,6 +696,14 @@ function StatusPill({ status }: { status: Status }) {
 
 function Th({ children }: { children: React.ReactNode }) {
   return <th style={{ textAlign: "left", padding: 10, fontSize: 13, color: "#444" }}>{children}</th>;
+}
+
+function Td({ children, colSpan }: { children: React.ReactNode; colSpan?: number }) {
+  return (
+    <td colSpan={colSpan} style={{ padding: 10, verticalAlign: "top" }}>
+      {children}
+    </td>
+  );
 }
 
 function Td({ children, colSpan }: { children: React.ReactNode; colSpan?: number }) {
