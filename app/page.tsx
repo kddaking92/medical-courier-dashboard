@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
 type Owner = "Co-Owner A (Ops/Compliance)" | "Co-Owner B (Sales/Finance)";
@@ -25,6 +25,24 @@ type TaskRow = {
   updated_at?: string;
 };
 
+type TaskNoteRow = {
+  id: string;
+  task_id: string;
+  owner: Owner;
+  note: string;
+  updated_at: string;
+};
+
+function fmtDate(iso?: string) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+const OWNER_A: Owner = "Co-Owner A (Ops/Compliance)";
+const OWNER_B: Owner = "Co-Owner B (Sales/Finance)";
+const ALL_OWNERS: Owner[] = [OWNER_A, OWNER_B];
+
 export default function DashboardPage() {
   const [authChecked, setAuthChecked] = useState(false);
   const [userEmail, setUserEmail] = useState<string>("");
@@ -35,10 +53,23 @@ export default function DashboardPage() {
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [loadingWeeks, setLoadingWeeks] = useState(false);
   const [loadingTasks, setLoadingTasks] = useState(false);
+
   const [errorMsg, setErrorMsg] = useState<string>("");
 
-  const [newOwner, setNewOwner] = useState<Owner>("Co-Owner A (Ops/Compliance)");
+  const [newOwner, setNewOwner] = useState<Owner>(OWNER_A);
   const [newDesc, setNewDesc] = useState<string>("");
+
+  // Notes state
+  // notesByTask[taskId][owner] = { note, updated_at }
+  const [notesByTask, setNotesByTask] = useState<
+    Record<string, Record<string, { note: string; updated_at?: string; id?: string }>>
+  >({});
+
+  // Draft notes in UI (so typing doesn't instantly overwrite saved state)
+  const [draftByTask, setDraftByTask] = useState<Record<string, Record<string, string>>>({});
+
+  // For realtime filtering
+  const taskIdSetRef = useRef<Set<string>>(new Set());
 
   // ---------- AUTH GATE ----------
   useEffect(() => {
@@ -49,7 +80,6 @@ export default function DashboardPage() {
       if (error) console.error(error);
 
       const session = data.session;
-
       if (!session) {
         window.location.assign("/login");
         return;
@@ -64,9 +94,7 @@ export default function DashboardPage() {
     requireAuth();
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!session) {
-        window.location.assign("/login");
-      }
+      if (!session) window.location.assign("/login");
     });
 
     return () => {
@@ -75,7 +103,7 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // ---------- DATA LOADERS ----------
+  // ---------- LOADERS ----------
   const loadWeeks = async () => {
     setErrorMsg("");
     setLoadingWeeks(true);
@@ -104,7 +132,6 @@ export default function DashboardPage() {
 
     setWeeks(safeWeeks);
 
-    // choose first week if not set
     if (safeWeeks.length > 0 && !safeWeeks.some((x) => x.week_number === selectedWeek)) {
       setSelectedWeek(safeWeeks[0].week_number);
     }
@@ -128,17 +155,67 @@ export default function DashboardPage() {
       return;
     }
 
-    setTasks((data ?? []) as TaskRow[]);
+    const rows = (data ?? []) as TaskRow[];
+    setTasks(rows);
+
+    // Update taskId set for realtime filtering
+    const set = new Set<string>(rows.map((t) => t.id));
+    taskIdSetRef.current = set;
+
+    // Load notes for these tasks
+    await loadNotesForTasks(rows.map((t) => t.id));
   };
 
-  // load weeks after auth
+  const loadNotesForTasks = async (taskIds: string[]) => {
+    setErrorMsg("");
+    if (taskIds.length === 0) {
+      setNotesByTask({});
+      setDraftByTask({});
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("task_notes")
+      .select("id,task_id,owner,note,updated_at")
+      .in("task_id", taskIds);
+
+    if (error) {
+      console.error(error);
+      setErrorMsg(`Failed to load task notes: ${error.message}`);
+      return;
+    }
+
+    const noteRows = (data ?? []) as TaskNoteRow[];
+
+    // Build notes map with defaults for both owners
+    const nextNotes: Record<string, Record<string, { note: string; updated_at?: string; id?: string }>> = {};
+    const nextDraft: Record<string, Record<string, string>> = {};
+
+    for (const taskId of taskIds) {
+      nextNotes[taskId] = {};
+      nextDraft[taskId] = {};
+      for (const o of ALL_OWNERS) {
+        nextNotes[taskId][o] = { note: "", updated_at: undefined, id: undefined };
+        nextDraft[taskId][o] = "";
+      }
+    }
+
+    for (const r of noteRows) {
+      if (!nextNotes[r.task_id]) continue;
+      nextNotes[r.task_id][r.owner] = { note: r.note ?? "", updated_at: r.updated_at, id: r.id };
+      nextDraft[r.task_id][r.owner] = r.note ?? "";
+    }
+
+    setNotesByTask(nextNotes);
+    setDraftByTask(nextDraft);
+  };
+
   useEffect(() => {
     if (!authChecked) return;
     loadWeeks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authChecked]);
 
-  // load tasks when week changes
   useEffect(() => {
     if (!authChecked) return;
     if (!selectedWeek) return;
@@ -146,34 +223,40 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authChecked, selectedWeek]);
 
-  // OPTIONAL REALTIME: refresh tasks when anyone changes tasks for selected week
+  // ---------- REALTIME ----------
   useEffect(() => {
     if (!authChecked || !selectedWeek) return;
 
-    const channel = supabase
+    // Tasks realtime by week filter
+    const tasksChannel = supabase
       .channel(`tasks-week-${selectedWeek}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "tasks", filter: `week_number=eq.${selectedWeek}` },
-        () => {
-          loadTasks(selectedWeek);
+        async () => {
+          await loadTasks(selectedWeek);
         }
       )
       .subscribe();
 
+    // Notes realtime (no reliable week filter), so we filter in callback by task_id set
+    const notesChannel = supabase
+      .channel(`task-notes`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "task_notes" }, async (payload: any) => {
+        const taskId = payload?.new?.task_id ?? payload?.old?.task_id;
+        if (taskId && taskIdSetRef.current.has(taskId)) {
+          // reload notes for current tasks only
+          await loadNotesForTasks(Array.from(taskIdSetRef.current));
+        }
+      })
+      .subscribe();
+
     return () => {
-      supabase.removeChannel(channel);
+      supabase.removeChannel(tasksChannel);
+      supabase.removeChannel(notesChannel);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authChecked, selectedWeek]);
-
-  const selectedWeekRow = useMemo(
-    () => (selectedWeek ? weeks.find((w) => w.week_number === selectedWeek) ?? null : null),
-    [weeks, selectedWeek]
-  );
-
-  const completedCount = tasks.filter((t) => t.status === "Completed").length;
-  const progressPct = tasks.length ? Math.round((completedCount / tasks.length) * 100) : 0;
 
   // ---------- MUTATIONS ----------
   const addTask = async () => {
@@ -197,29 +280,71 @@ export default function DashboardPage() {
     }
 
     setNewDesc("");
-    // realtime will refresh; if disabled, uncomment:
-    // await loadTasks(selectedWeek);
+    // realtime will refresh
+  };
+
+  const setTaskCompleted = async (taskId: string, completed: boolean) => {
+    setErrorMsg("");
+    const status: Status = completed ? "Completed" : "Pending";
+
+    const { error } = await supabase.from("tasks").update({ status }).eq("id", taskId);
+    if (error) {
+      console.error(error);
+      setErrorMsg(`Failed to update task: ${error.message}`);
+    }
   };
 
   const updateStatus = async (taskId: string, status: Status) => {
     setErrorMsg("");
-
     const { error } = await supabase.from("tasks").update({ status }).eq("id", taskId);
-
     if (error) {
       console.error(error);
       setErrorMsg(`Failed to update task: ${error.message}`);
+    }
+  };
+
+  // Upsert note (one row per task + owner)
+  const saveNote = async (taskId: string, owner: Owner) => {
+    setErrorMsg("");
+    const note = (draftByTask?.[taskId]?.[owner] ?? "").trim();
+
+    const { error } = await supabase.from("task_notes").upsert(
+      {
+        task_id: taskId,
+        owner,
+        note,
+      },
+      { onConflict: "task_id,owner" }
+    );
+
+    if (error) {
+      console.error(error);
+      setErrorMsg(`Failed to save note: ${error.message}`);
       return;
     }
 
-    // realtime will refresh; if disabled, uncomment:
-    // await loadTasks(selectedWeek!);
+    // realtime will refresh notes; but we can optimistic update too:
+    setNotesByTask((prev) => {
+      const next = { ...prev };
+      next[taskId] = { ...(next[taskId] ?? {}) };
+      next[taskId][owner] = { note, updated_at: new Date().toISOString() };
+      return next;
+    });
   };
 
   const signOut = async () => {
     await supabase.auth.signOut();
     window.location.assign("/login");
   };
+
+  // ---------- DERIVED ----------
+  const week = useMemo(() => {
+    if (!selectedWeek) return null;
+    return weeks.find((w) => w.week_number === selectedWeek) ?? null;
+  }, [weeks, selectedWeek]);
+
+  const completedCount = tasks.filter((t) => t.status === "Completed").length;
+  const progressPct = tasks.length ? Math.round((completedCount / tasks.length) * 100) : 0;
 
   // ---------- RENDER ----------
   if (!authChecked) {
@@ -288,12 +413,12 @@ export default function DashboardPage() {
       </section>
 
       <section style={{ marginTop: 18, padding: 14, border: "1px solid #ddd", borderRadius: 12 }}>
-        {!selectedWeekRow ? (
+        {!week ? (
           <div>Select a week to see details.</div>
         ) : (
           <>
             <h2 style={{ marginTop: 0 }}>
-              Week {selectedWeekRow.week_number}: {selectedWeekRow.title}
+              Week {week.week_number}: {week.title}
             </h2>
 
             <div style={{ color: "#444", marginBottom: 8 }}>
@@ -305,10 +430,10 @@ export default function DashboardPage() {
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-              <Box title="Objectives" items={selectedWeekRow.objectives} />
-              <Box title="Deliverables" items={selectedWeekRow.deliverables} />
-              <Box title="KPIs" items={selectedWeekRow.kpis} />
-              <Box title="Risks" items={selectedWeekRow.risks} tone="risk" />
+              <Box title="Objectives" items={week.objectives} />
+              <Box title="Deliverables" items={week.deliverables} />
+              <Box title="KPIs" items={week.kpis} />
+              <Box title="Risks" items={week.risks} tone="risk" />
             </div>
           </>
         )}
@@ -319,8 +444,8 @@ export default function DashboardPage() {
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
           <select value={newOwner} onChange={(e) => setNewOwner(e.target.value as Owner)}>
-            <option>Co-Owner A (Ops/Compliance)</option>
-            <option>Co-Owner B (Sales/Finance)</option>
+            <option>{OWNER_A}</option>
+            <option>{OWNER_B}</option>
           </select>
 
           <input
@@ -339,44 +464,118 @@ export default function DashboardPage() {
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead style={{ background: "#fafafa" }}>
               <tr>
+                <Th>Done</Th>
                 <Th>Owner</Th>
                 <Th>Description</Th>
                 <Th>Status</Th>
-                <Th>Actions</Th>
+                <Th>Updates (Real-time)</Th>
               </tr>
             </thead>
             <tbody>
               {tasks.length === 0 ? (
                 <tr>
-                  <Td colSpan={4}>No tasks for this week yet.</Td>
+                  <Td colSpan={5}>No tasks for this week yet.</Td>
                 </tr>
               ) : (
-                tasks.map((t) => (
-                  <tr key={t.id} style={{ borderTop: "1px solid #eee" }}>
-                    <Td>{t.owner}</Td>
-                    <Td>{t.description}</Td>
-                    <Td>
-                      <StatusPill status={t.status} />
-                    </Td>
-                    <Td>
-                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        <button type="button" onClick={() => updateStatus(t.id, "Pending")}>
-                          Pending
-                        </button>
-                        <button type="button" onClick={() => updateStatus(t.id, "In Progress")}>
-                          In Progress
-                        </button>
-                        <button type="button" onClick={() => updateStatus(t.id, "Completed")}>
-                          Completed
-                        </button>
-                      </div>
-                    </Td>
-                  </tr>
-                ))
+                tasks.map((t) => {
+                  const checked = t.status === "Completed";
+                  const notesA = notesByTask?.[t.id]?.[OWNER_A];
+                  const notesB = notesByTask?.[t.id]?.[OWNER_B];
+
+                  const draftA = draftByTask?.[t.id]?.[OWNER_A] ?? "";
+                  const draftB = draftByTask?.[t.id]?.[OWNER_B] ?? "";
+
+                  return (
+                    <tr key={t.id} style={{ borderTop: "1px solid #eee", verticalAlign: "top" }}>
+                      <Td>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => setTaskCompleted(t.id, e.target.checked)}
+                        />
+                      </Td>
+
+                      <Td>{t.owner}</Td>
+
+                      <Td style={{ maxWidth: 380 }}>
+                        <div style={{ fontWeight: 700 }}>{t.description}</div>
+                        <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button type="button" onClick={() => updateStatus(t.id, "Pending")}>
+                            Pending
+                          </button>
+                          <button type="button" onClick={() => updateStatus(t.id, "In Progress")}>
+                            In Progress
+                          </button>
+                          <button type="button" onClick={() => updateStatus(t.id, "Completed")}>
+                            Completed
+                          </button>
+                        </div>
+                      </Td>
+
+                      <Td>
+                        <StatusPill status={t.status} />
+                      </Td>
+
+                      <Td>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, minWidth: 520 }}>
+                          <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+                            <div style={{ fontWeight: 800, marginBottom: 6 }}>{OWNER_A}</div>
+                            <textarea
+                              value={draftA}
+                              onChange={(e) =>
+                                setDraftByTask((prev) => ({
+                                  ...prev,
+                                  [t.id]: { ...(prev[t.id] ?? {}), [OWNER_A]: e.target.value },
+                                }))
+                              }
+                              placeholder="Type your update…"
+                              style={{ width: "100%", minHeight: 90 }}
+                            />
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 8 }}>
+                              <button type="button" onClick={() => saveNote(t.id, OWNER_A)}>
+                                Save update
+                              </button>
+                              <div style={{ fontSize: 12, color: "#666" }}>
+                                Last: {fmtDate(notesA?.updated_at)}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+                            <div style={{ fontWeight: 800, marginBottom: 6 }}>{OWNER_B}</div>
+                            <textarea
+                              value={draftB}
+                              onChange={(e) =>
+                                setDraftByTask((prev) => ({
+                                  ...prev,
+                                  [t.id]: { ...(prev[t.id] ?? {}), [OWNER_B]: e.target.value },
+                                }))
+                              }
+                              placeholder="Type your update…"
+                              style={{ width: "100%", minHeight: 90 }}
+                            />
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 8 }}>
+                              <button type="button" onClick={() => saveNote(t.id, OWNER_B)}>
+                                Save update
+                              </button>
+                              <div style={{ fontSize: 12, color: "#666" }}>
+                                Last: {fmtDate(notesB?.updated_at)}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </Td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
         </div>
+
+        <p style={{ color: "#666", marginTop: 10, fontSize: 13 }}>
+          Notes are stored in Supabase (<code>task_notes</code>). Updates are shared in real time across users.
+        </p>
       </section>
     </div>
   );
@@ -384,7 +583,14 @@ export default function DashboardPage() {
 
 function Box({ title, items, tone }: { title: string; items: string[]; tone?: "risk" }) {
   return (
-    <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, background: tone === "risk" ? "#fff7f7" : "#fff" }}>
+    <div
+      style={{
+        border: "1px solid #eee",
+        borderRadius: 12,
+        padding: 12,
+        background: tone === "risk" ? "#fff7f7" : "#fff",
+      }}
+    >
       <div style={{ fontWeight: 800, marginBottom: 8 }}>{title}</div>
       <ul style={{ margin: 0, paddingLeft: 18 }}>
         {items.map((x, idx) => (
@@ -403,7 +609,18 @@ function StatusPill({ status }: { status: Status }) {
   const text = status === "Completed" ? "#166534" : status === "In Progress" ? "#7a5d00" : "#333";
 
   return (
-    <span style={{ display: "inline-block", padding: "5px 10px", borderRadius: 999, background: bg, border: `1px solid ${border}`, color: text, fontWeight: 800, fontSize: 12 }}>
+    <span
+      style={{
+        display: "inline-block",
+        padding: "5px 10px",
+        borderRadius: 999,
+        background: bg,
+        border: `1px solid ${border}`,
+        color: text,
+        fontWeight: 800,
+        fontSize: 12,
+      }}
+    >
       {status}
     </span>
   );
